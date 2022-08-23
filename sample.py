@@ -500,11 +500,11 @@ def do_run():
             return -torch.autograd.grad(loss, x)[0]
 
     if args.init_image:
-        init = Image.open(args.init_image).convert('RGB')
+        init = Image.open(fetch(args.init_image)).convert('RGB')
         init = init.resize((int(args.width),  int(args.height)), Image.LANCZOS)
         init = TF.to_tensor(init).to(device).unsqueeze(0).clamp(0,1)
-        h = ldm.encode(init * 2 - 1).sample() *  0.18215
-        init = torch.cat(args.batch_size*2*[h], dim=0)
+        h = ldm.encode(init * 2 - 1).sample() * 0.18215
+        init = torch.cat(args.batch_size*2*[h], dim=0) if not is_k else torch.cat(args.batch_size*[h], dim=0)
     else:
         init = None
 
@@ -518,7 +518,8 @@ def do_run():
         model_wrap = K.external.OpenAIDenoiser(model_fn, diffusion, device=device, has_learned_sigmas=False)
         sigmas = model_wrap.get_sigmas(args.steps)
         if init is not None:
-            sigmas = sigmas[sigmas <= args.skip_timesteps]
+            # sigmas = sigmas[sigmas <= args.skip_timesteps]
+            sigmas = sigmas[args.skip_timesteps:]
         # def callback(info):
         #     if info['i'] % 50 == 0:
         #         denoised = info['denoised']

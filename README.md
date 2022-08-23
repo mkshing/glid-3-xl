@@ -12,9 +12,15 @@ Modified By Makoto Shing (https://github.com/mkshing, https://twitter.com/mk1sta
     python sample.py --model_path finetune.pt --sampler k_lms --text "A ukiyoe of a countryside in Japan" --batch_size 4
     ```
      Also, support `["ddpm", "ddim", "plms", "k_euler", "k_euler_ancestral", "k_heun", "k_dpm_2", "k_dpm_2_ancestral", "k_lms"]`.
-    
-
   ![k_lms](outputs/k_lms.png)
+
+
+- k-samplers+`init_image` also works.
+  ```
+  python3 sample.py --init_image https://p4.wallpaperbetter.com/wallpaper/532/552/965/anime-studio-ghibli-artwork-landscape-wallpaper-preview.jpg --skip_timesteps 20 --text "4K HD painting of the view from across the fields" --batch_size 4
+  ```
+  
+  ![init_image](outputs/init_image.png)
 ------------
 
 # GLID-3-XL
