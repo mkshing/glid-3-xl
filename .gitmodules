@@ -1,0 +1,6 @@
+[submodule "k-diffusion"]
+	path = k-diffusion
+	url = https://github.com/crowsonkb/k-diffusion.git
+[submodule "latent-diffusion"]
+	path = latent-diffusion
+	url = https://github.com/CompVis/latent-diffusion.git

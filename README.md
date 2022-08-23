@@ -1,3 +1,22 @@
+## GLID-3-XL + k-diffusion sampler 
+Modified By Makoto Shing (https://github.com/mkshing, https://twitter.com/mk1stats).
+- Support `k-diffusion` sampler
+    
+    First of all, install [k-diffusion](https://github.com/crowsonkb/k-diffusion) by Katherine Crowson (https://github.com/crowsonkb, https://twitter.com/RiversHaveWings).
+    ```
+    pip install git+https://github.com/crowsonkb/k-diffusion
+    ```
+
+    For `k_lms` sampler
+    ```
+    python sample.py --model_path finetune.pt --sampler k_lms --text "A ukiyoe of a countryside in Japan" --batch_size 4
+    ```
+     Also, support `["ddpm", "ddim", "plms", "k_euler", "k_euler_ancestral", "k_heun", "k_dpm_2", "k_dpm_2_ancestral", "k_lms"]`.
+    
+
+  ![k_lms](outputs/k_lms.png)
+------------
+
 # GLID-3-XL
 
 GLID-3-xl is the [1.4B latent diffusion](https://github.com/CompVis/latent-diffusion#april-2022) model from CompVis back-ported to the guided diffusion codebase

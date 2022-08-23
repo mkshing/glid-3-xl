@@ -16,8 +16,6 @@ import numpy as np
 
 from guided_diffusion.script_util import create_model_and_diffusion, model_and_diffusion_defaults
 
-from dalle_pytorch import DiscreteVAE, VQGanVAE
-
 from einops import rearrange
 from math import log2, sqrt
 
@@ -29,6 +27,7 @@ import os
 from encoders.modules import BERTEmbedder
 
 import clip
+import k_diffusion as K
 
 # argument parsing
 
@@ -91,10 +90,10 @@ parser.add_argument('--height', type = int, default = 256, required = False,
 parser.add_argument('--seed', type = int, default=-1, required = False,
                     help='random seed')
 
-parser.add_argument('--guidance_scale', type = float, default = 5.0, required = False,
+parser.add_argument('--guidance_scale', type = float, default = 7.0, required = False,
                     help='classifier-free guidance scale')
 
-parser.add_argument('--steps', type = int, default = 0, required = False,
+parser.add_argument('--steps', type = int, default = 50, required = False,
                     help='number of diffusion steps')
 
 parser.add_argument('--cpu', dest='cpu', action='store_true')
@@ -109,9 +108,11 @@ parser.add_argument('--clip_guidance_scale', type = float, default = 150, requir
 parser.add_argument('--cutn', type = int, default = 16, required = False,
                     help='Number of cuts')
 
-parser.add_argument('--ddim', dest='ddim', action='store_true') # turn on to use 50 step ddim
-
-parser.add_argument('--ddpm', dest='ddpm', action='store_true') # turn on to use 50 step ddim
+parser.add_argument(
+    "--sampler",
+    default="k_lms",
+    choices=["ddpm", "ddim", "plms", "k_euler", "k_euler_ancestral", "k_heun", "k_dpm_2", "k_dpm_2_ancestral", "k_lms"]
+)
 
 args = parser.parse_args()
 
@@ -177,6 +178,15 @@ if args.edit and not args.mask:
             self.canvas = QtGui.QPixmap.fromImage(canvas)
             self.canvas.fill(Qt.transparent)
 
+
+def make_grid_from_pils(pil_images):
+    w, h = pil_images[0].size
+    grid_img = Image.new("RGB", ((len(pil_images)) * w, h))
+    for idx, image in enumerate(pil_images):
+        grid_img.paste(image, (idx * w, 0))
+    return grid_img
+
+
 def fetch(url_or_path):
     if str(url_or_path).startswith('http://') or str(url_or_path).startswith('https://'):
         r = requests.get(url_or_path)
@@ -223,6 +233,36 @@ def tv_loss(input):
     y_diff = input[..., 1:, :-1] - input[..., :-1, :-1]
     return (x_diff**2 + y_diff**2).mean([1, 2, 3])
 
+
+class CFGDenoiserForGlid(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.inner_model = model
+
+    def forward(self, x, sigma, cond_scale, **kwargs):
+        x_in = torch.cat([x] * 2)
+        sigma_in = torch.cat([sigma] * 2)
+        cond, uncond = self.inner_model(x_in, sigma_in, **kwargs).chunk(2)
+        return uncond + (cond - uncond) * cond_scale
+
+
+class GuidedDenoiserWithGrad(nn.Module):
+    def __init__(self, model, cond_fn):
+        super().__init__()
+        self.inner_model = model
+        self.cond_fn = cond_fn
+        self.orig_denoised = None
+
+    def forward(self, x, sigma, **kwargs):
+        with torch.enable_grad():
+            x = x.detach().requires_grad_()
+            denoised = self.inner_model(x, sigma, **kwargs)
+            self.orig_denoised = denoised.detach()
+            cond_grad = self.cond_fn(x, sigma, denoised=denoised, **kwargs)
+        cond_denoised = denoised + cond_grad * K.utils.append_dims(sigma ** 2, x.ndim)
+        return cond_denoised
+
+
 device = torch.device('cuda:0' if (torch.cuda.is_available() and not args.cpu) else 'cpu')
 print('Using device:', device)
 
@@ -249,15 +289,22 @@ model_params = {
     'super_res_condition': True if 'external_block.0.0.weight' in model_state_dict else False,
 }
 
-if args.ddpm:
-    model_params['timestep_respacing'] = 1000
-if args.ddim:
-    if args.steps:
-        model_params['timestep_respacing'] = 'ddim'+str(args.steps)
-    else:
-        model_params['timestep_respacing'] = 'ddim50'
-elif args.steps:
-    model_params['timestep_respacing'] = str(args.steps)
+print(f"text: {args.text}")
+print(f"sampler: {args.sampler}")
+is_k = args.sampler not in ["ddpm", "ddim", "plms"]
+
+if is_k:
+    model_params['timestep_respacing'] = '1000'
+else:
+    if args.sampler == "ddpm":
+        model_params['timestep_respacing'] = '1000'
+    if args.sampler == "ddim":
+        if args.steps:
+            model_params['timestep_respacing'] = 'ddim'+str(args.steps)
+        else:
+            model_params['timestep_respacing'] = 'ddim50'
+    elif args.steps:
+        model_params['timestep_respacing'] = str(args.steps)
 
 model_config = model_and_diffusion_defaults()
 model_config.update(model_params)
@@ -309,7 +356,6 @@ def do_run():
 
     text = clip.tokenize([args.text]*args.batch_size, truncate=True).to(device)
     text_clip_blank = clip.tokenize([args.negative]*args.batch_size, truncate=True).to(device)
-
 
     # clip context
     text_emb_clip = clip_model.encode_text(text)
@@ -452,13 +498,54 @@ def do_run():
             loss = losses.sum() * args.clip_guidance_scale
 
             return -torch.autograd.grad(loss, x)[0]
- 
-    if args.ddpm:
-        sample_fn = diffusion.ddpm_sample_loop_progressive
-    elif args.ddim:
-        sample_fn = diffusion.ddim_sample_loop_progressive
+
+    if args.init_image:
+        init = Image.open(args.init_image).convert('RGB')
+        init = init.resize((int(args.width),  int(args.height)), Image.LANCZOS)
+        init = TF.to_tensor(init).to(device).unsqueeze(0).clamp(0,1)
+        h = ldm.encode(init * 2 - 1).sample() *  0.18215
+        init = torch.cat(args.batch_size*2*[h], dim=0)
     else:
+        init = None
+
+    if args.sampler == "ddpm":
+        sample_fn = diffusion.ddpm_sample_loop_progressive
+    elif args.sampler == "ddim":
+        sample_fn = diffusion.ddim_sample_loop_progressive
+    elif args.sampler == "plms":
         sample_fn = diffusion.plms_sample_loop_progressive
+    else:
+        model_wrap = K.external.OpenAIDenoiser(model_fn, diffusion, device=device, has_learned_sigmas=False)
+        sigmas = model_wrap.get_sigmas(args.steps)
+        if init is not None:
+            sigmas = sigmas[sigmas <= args.skip_timesteps]
+        # def callback(info):
+        #     if info['i'] % 50 == 0:
+        #         denoised = info['denoised']
+        #         nrow = math.ceil(denoised.shape[0] ** 0.5)
+        #         grid = make_grid(denoised, nrow, padding=0)
+        #         tqdm.write(f'Step {info["i"]} of {len(sigmas) - 1}, sigma {info["sigma"]:g}:')
+        #         # Display
+        #         # display.display(K.utils.to_pil_image(grid))
+        #         tqdm.write(f'')
+        callback = None
+        model_wrap = CFGDenoiserForGlid(model_wrap)
+        if args.clip_guidance:
+            model_wrap = GuidedDenoiserWithGrad(model_wrap, cond_fn)
+        if args.sampler == "k_lms":
+            sample_fn = K.sampling.sample_lms
+        elif args.sampler == "k_euler":
+            sample_fn = K.sampling.sample_euler
+        elif args.sampler == "k_euler_ancestral":
+            sample_fn = K.sampling.sample_euler_ancestral
+        elif args.sampler == "k_heun":
+            sample_fn = K.sampling.sample_heun
+        elif args.sampler == "k_dpm_2":
+            sample_fn = K.sampling.sample_dpm_2
+        elif args.sampler == "k_dpm_2_ancestral":
+            sample_fn = K.sampling.sample_dpm_2_ancestral
+
+    all_samples = []
 
     def save_sample(i, sample, clip_score=False):
         for k, image in enumerate(sample['pred_xstart'][:args.batch_size]):
@@ -466,12 +553,12 @@ def do_run():
             im = image.unsqueeze(0)
             out = ldm.decode(im)
 
-            npy_filename = f'output_npy/{args.prefix}{i * args.batch_size + k:05}.npy'
-            with open(npy_filename, 'wb') as outfile:
-                np.save(outfile, image.detach().cpu().numpy())
+            # npy_filename = f'output_npy/{args.prefix}{i * args.batch_size + k:05}.npy'
+            # with open(npy_filename, 'wb') as outfile:
+            #     np.save(outfile, image.detach().cpu().numpy())
 
             out = TF.to_pil_image(out.squeeze(0).add(1).div(2).clamp(0, 1))
-
+            all_samples.append(out)
             filename = f'output/{args.prefix}{i * args.batch_size + k:05}.png'
             out.save(filename)
 
@@ -487,36 +574,46 @@ def do_run():
                 npy_final = f'output_npy/{args.prefix}_{similarity.item():0.3f}_{i * args.batch_size + k:05}.npy'
                 os.rename(npy_filename, npy_final)
 
-    if args.init_image:
-        init = Image.open(args.init_image).convert('RGB')
-        init = init.resize((int(args.width),  int(args.height)), Image.LANCZOS)
-        init = TF.to_tensor(init).to(device).unsqueeze(0).clamp(0,1)
-        h = ldm.encode(init * 2 - 1).sample() *  0.18215
-        init = torch.cat(args.batch_size*2*[h], dim=0)
-    else:
-        init = None
-
     for i in range(args.num_batches):
-        cur_t = diffusion.num_timesteps - 1
+        if is_k:
+            x = torch.randn([args.batch_size, 4, int(args.height / 8), int(args.width / 8)], device=device) * sigmas[0]
+            if init is not None:
+                x += init
+            samples = sample_fn(model_wrap, x, sigmas, callback=callback, extra_args={'cond_scale': args.guidance_scale, **kwargs})
+            samples /= 0.18215
+            samples = ldm.decode(samples)
+            samples = samples.add(1).div(2).clamp(0, 1)
 
-        samples = sample_fn(
-            model_fn,
-            (args.batch_size*2, 4, int(args.height/8), int(args.width/8)),
-            clip_denoised=False,
-            model_kwargs=kwargs,
-            cond_fn=cond_fn if args.clip_guidance else None,
-            device=device,
-            progress=True,
-            init_image=init,
-            skip_timesteps=args.skip_timesteps,
-        )
+            for k, out in enumerate(samples):
+                filename = f'output/{args.prefix}{i * args.batch_size + k:05}.png'
+                pil_img = TF.to_pil_image(out)
+                all_samples.append(pil_img)
+                pil_img.save(filename)
 
-        for j, sample in enumerate(samples):
-            cur_t -= 1
-            if j % 5 == 0 and j != diffusion.num_timesteps - 1:
-                save_sample(i, sample)
+        else:
+            cur_t = diffusion.num_timesteps - 1
 
-        save_sample(i, sample, args.clip_score)
+            samples = sample_fn(
+                model_fn,
+                (args.batch_size*2, 4, int(args.height/8), int(args.width/8)),
+                clip_denoised=False,
+                model_kwargs=kwargs,
+                cond_fn=cond_fn if args.clip_guidance else None,
+                device=device,
+                progress=True,
+                init_image=init,
+                skip_timesteps=args.skip_timesteps,
+            )
+
+            for j, sample in enumerate(samples):
+                cur_t -= 1
+                if j % 5 == 0 and j != diffusion.num_timesteps - 1:
+                    save_sample(i, sample)
+
+            save_sample(i, sample, args.clip_score)
+
+    img_grid = make_grid_from_pils(all_samples)
+    img_grid.save("out.png")
 
 gc.collect()
 do_run()
