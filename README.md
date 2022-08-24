@@ -1,5 +1,8 @@
 ## GLID-3-XL + k-diffusion sampler 
 Modified By Makoto Shing (https://github.com/mkshing, https://twitter.com/mk1stats).
+
+You might be interested in [Stable Diffusion + k-diffusion sampler ](https://github.com/mkshing/stable-diffusion) too.
+
 - Support `k-diffusion` sampler
     
     First of all, install [k-diffusion](https://github.com/crowsonkb/k-diffusion) by Katherine Crowson (https://github.com/crowsonkb, https://twitter.com/RiversHaveWings).
